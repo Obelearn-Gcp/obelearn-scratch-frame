@@ -62,7 +62,7 @@ for (const file of readdirSync(gui).filter((name) => name.endsWith(".hex"))) {
 }
 cpSync(libraryAssets, join(out, "library-assets"), { recursive: true });
 
-for (const file of ["index.html", "sandbox-shims.js", "frame.js", "frame.css"]) {
+for (const file of ["index.html", "frame-guard.js", "sandbox-shims.js", "frame.js", "frame.css"]) {
   cpSync(join(root, "src", file), join(out, file));
 }
 cpSync(join(root, "LICENSE"), join(out, "LICENSE.txt"));
