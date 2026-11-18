@@ -4,7 +4,10 @@
   var GUI = window.GUI;
   var MAX_SB3_BYTES = 100 * 1024 * 1024;
   var LOAD_TIMEOUT_MS = 45000;
-  var CHANGE_THROTTLE_MS = 1000;
+  var VIEW_THROTTLE_MS = 500;
+  var SETTLE_MS = 300;
+  var SETTLE_MAX_MS = 15000;
+  var UPDATE_METRICS = "scratch-gui/workspace-metrics/UPDATE_METRICS";
   var LOAD_ERROR = "Scratch couldn't load.";
   var OPEN_ERROR = "This Scratch project couldn't be opened.";
   var EXPORT_ERROR = "This Scratch project couldn't be saved.";
@@ -13,11 +16,14 @@
   var assetBase = new URL("library-assets/", window.location.href).href;
   var params = new URLSearchParams(window.location.search);
   var startAsPlayer = params.get("mode") === "player";
+  var maxAssetBytes = Number(params.get("max-asset-bytes")) || 0;
 
   var ready = false;
   var loading = false;
-  var lastChangeAt = 0;
-  var changeTimer = null;
+  var viewTimer = null;
+  var pointerDown = false;
+  var lastPointerUp = 0;
+  var lastMetrics = null;
   var store = null;
 
   function post(message, transfer) {
@@ -90,22 +96,121 @@
     return store.getState().scratchGui.vm;
   }
 
+  function assetBytes(item) {
+    var data = item && item.asset && item.asset.data;
+    return data ? data.byteLength || data.length || 0 : 0;
+  }
+
+  function isTooLarge(item) {
+    return assetBytes(item) > maxAssetBytes;
+  }
+
+  function refuseAsset() {
+    post({ type: "scratch:asset-too-large" });
+    return Promise.reject(new Error("Asset too large."));
+  }
+
+  function limitAssets(vm) {
+    if (!maxAssetBytes) return;
+    var addCostume = vm.addCostume.bind(vm);
+    var addBackdrop = vm.addBackdrop.bind(vm);
+    var addSound = vm.addSound.bind(vm);
+    var addSprite = vm.addSprite.bind(vm);
+    vm.addCostume = function (md5ext, costume, targetId, version) {
+      return isTooLarge(costume) ? refuseAsset() : addCostume(md5ext, costume, targetId, version);
+    };
+    vm.addBackdrop = function (md5ext, backdrop) {
+      return isTooLarge(backdrop) ? refuseAsset() : addBackdrop(md5ext, backdrop);
+    };
+    vm.addSound = function (sound, targetId) {
+      return isTooLarge(sound) ? refuseAsset() : addSound(sound, targetId);
+    };
+    vm.addSprite = function (input) {
+      var before = vm.runtime.targets.map(function (target) {
+        return target.id;
+      });
+      return addSprite(input).then(function (result) {
+        var oversized = vm.runtime.targets.filter(function (target) {
+          return (
+            target.isOriginal &&
+            before.indexOf(target.id) === -1 &&
+            (target.sprite.costumes.some(isTooLarge) || target.sprite.sounds.some(isTooLarge))
+          );
+        });
+        if (!oversized.length) return result;
+        oversized.forEach(function (target) {
+          vm.deleteSprite(target.id);
+        });
+        return refuseAsset();
+      });
+    };
+  }
+
+  function targetKey(target) {
+    return target.isStage ? "__stage__" : target.getName();
+  }
+
+  function isNumber(value) {
+    return typeof value === "number" && isFinite(value);
+  }
+
+  function readView(metrics) {
+    var vm = getVm();
+    var view = {};
+    Object.keys(metrics.targets).forEach(function (id) {
+      var target = vm.runtime.getTargetById(id);
+      var item = metrics.targets[id];
+      if (!target || !item) return;
+      view[targetKey(target)] = { scrollX: item.scrollX, scrollY: item.scrollY, scale: item.scale };
+    });
+    return view;
+  }
+
+  function onStoreChange() {
+    if (!ready || loading) return;
+    var metrics = store.getState().scratchGui.workspaceMetrics;
+    if (!metrics || metrics === lastMetrics) return;
+    lastMetrics = metrics;
+    if (viewTimer) return;
+    viewTimer = window.setTimeout(function () {
+      viewTimer = null;
+      post({ type: "scratch:view", view: readView(lastMetrics) });
+    }, VIEW_THROTTLE_MS);
+  }
+
+  function restoreView(view) {
+    if (!view || typeof view !== "object") return;
+    var vm = getVm();
+    var restored = false;
+    vm.runtime.targets.forEach(function (target) {
+      if (!target.isOriginal) return;
+      var item = view[targetKey(target)];
+      if (!item || !isNumber(item.scrollX) || !isNumber(item.scrollY) || !isNumber(item.scale) || item.scale <= 0) return;
+      store.dispatch({
+        type: UPDATE_METRICS,
+        targetID: target.id,
+        scrollX: item.scrollX,
+        scrollY: item.scrollY,
+        scale: item.scale
+      });
+      restored = true;
+    });
+    if (restored) vm.emitWorkspaceUpdate();
+  }
+
   function markReady() {
     if (ready) return;
     ready = true;
     window.clearTimeout(loadTimer);
     getVm().on("PROJECT_CHANGED", onProjectChanged);
+    limitAssets(getVm());
+    store.subscribe(onStoreChange);
     post({ type: "scratch:ready" });
   }
 
   function onProjectChanged() {
-    if (loading || changeTimer) return;
-    var wait = Math.max(0, lastChangeAt + CHANGE_THROTTLE_MS - Date.now());
-    changeTimer = window.setTimeout(function () {
-      changeTimer = null;
-      lastChangeAt = Date.now();
-      post({ type: "scratch:changed" });
-    }, wait);
+    if (loading) return;
+    post({ type: "scratch:changed" });
   }
 
   function setMode(mode) {
@@ -113,12 +218,13 @@
     store.dispatch(GUI.setPlayer(mode === "player"));
   }
 
-  function loadProject(sb3, mode) {
+  function loadProject(sb3, mode, view) {
     loading = true;
     setMode(mode);
     getVm()
       .loadProject(sb3)
       .then(function () {
+        restoreView(view);
         post({ type: "scratch:loaded" });
       })
       .catch(function () {
@@ -131,7 +237,41 @@
       });
   }
 
+  function releasePointer() {
+    pointerDown = false;
+    lastPointerUp = Date.now();
+  }
+
+  document.addEventListener(
+    "pointerdown",
+    function () {
+      pointerDown = true;
+    },
+    true
+  );
+  document.addEventListener("pointerup", releasePointer, true);
+  document.addEventListener("pointercancel", releasePointer, true);
+  window.addEventListener("blur", releasePointer);
+
+  function whenSettled(callback) {
+    var startedAt = Date.now();
+    (function check() {
+      var settled = !pointerDown && Date.now() - lastPointerUp >= SETTLE_MS;
+      if (settled || Date.now() - startedAt >= SETTLE_MAX_MS) {
+        callback();
+        return;
+      }
+      window.setTimeout(check, 100);
+    })();
+  }
+
   function exportProject(requestId) {
+    whenSettled(function () {
+      saveProject(requestId);
+    });
+  }
+
+  function saveProject(requestId) {
     getVm()
       .saveProjectSb3()
       .then(function (blob) {
@@ -163,7 +303,7 @@
         fail(OPEN_ERROR);
         return;
       }
-      loadProject(data.sb3, data.mode);
+      loadProject(data.sb3, data.mode, data.view);
       return;
     }
 
